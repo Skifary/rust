@@ -570,20 +570,19 @@ impl Display for BorrowMutError {
     }
 }
 
-// Values [1, MIN_WRITING-1] represent the number of `Ref` active. Values in
-// [MIN_WRITING, MAX-1] represent the number of `RefMut` active. Multiple
-// `RefMut`s can only be active at a time if they refer to distinct,
-// nonoverlapping components of a `RefCell` (e.g., different ranges of a slice).
+// Positive values represent the number of `Ref` active. Negative values
+// represent the number of `RefMut` active. Multiple `RefMut`s can only be
+// active at a time if they refer to distinct, nonoverlapping components of a
+// `RefCell` (e.g., different ranges of a slice).
 //
 // `Ref` and `RefMut` are both two words in size, and so there will likely never
 // be enough `Ref`s or `RefMut`s in existence to overflow half of the `usize`
-// range. Thus, a `BorrowFlag` will probably never overflow. However, this is
-// not a guarantee, as a pathological program could repeatedly create and then
-// mem::forget `Ref`s or `RefMut`s. Thus, all code must explicitly check for
-// overflow in order to avoid unsafety.
-type BorrowFlag = usize;
+// range. Thus, a `BorrowFlag` will probably never overflow or underflow.
+// However, this is not a guarantee, as a pathological program could repeatedly
+// create and then mem::forget `Ref`s or `RefMut`s. Thus, all code must
+// explicitly check for overflow and underflow in order to avoid unsafety.
+type BorrowFlag = isize;
 const UNUSED: BorrowFlag = 0;
-const MIN_WRITING: BorrowFlag = (!0)/2 + 1; // 0b1000...
 
 impl<T> RefCell<T> {
     /// Creates a new `RefCell` containing `value`.
@@ -1022,12 +1021,12 @@ impl<'b> BorrowRef<'b> {
     #[inline]
     fn new(borrow: &'b Cell<BorrowFlag>) -> Option<BorrowRef<'b>> {
         let b = borrow.get();
-        if b >= MIN_WRITING {
+        if b < UNUSED {
             None
         } else {
             // Prevent the borrow counter from overflowing into
             // a writing borrow.
-            assert!(b < MIN_WRITING - 1);
+            assert!(b != isize::max_value());
             borrow.set(b + 1);
             Some(BorrowRef { borrow })
         }
@@ -1038,7 +1037,7 @@ impl<'b> Drop for BorrowRef<'b> {
     #[inline]
     fn drop(&mut self) {
         let borrow = self.borrow.get();
-        debug_assert!(borrow < MIN_WRITING && borrow != UNUSED);
+        debug_assert!(borrow > UNUSED);
         self.borrow.set(borrow - 1);
     }
 }
@@ -1052,7 +1051,7 @@ impl<'b> Clone for BorrowRef<'b> {
         debug_assert!(borrow != UNUSED);
         // Prevent the borrow counter from overflowing into
         // a writing borrow.
-        assert!(borrow < MIN_WRITING - 1);
+        assert!(borrow != isize::max_value());
         self.borrow.set(borrow + 1);
         BorrowRef { borrow: self.borrow }
     }
@@ -1251,12 +1250,8 @@ impl<'b> Drop for BorrowRefMut<'b> {
     #[inline]
     fn drop(&mut self) {
         let borrow = self.borrow.get();
-        debug_assert!(borrow >= MIN_WRITING);
-        self.borrow.set(if borrow == MIN_WRITING {
-            UNUSED
-        } else {
-            borrow - 1
-        });
+        debug_assert!(borrow < UNUSED);
+        self.borrow.set(borrow + 1);
     }
 }
 
@@ -1266,10 +1261,10 @@ impl<'b> BorrowRefMut<'b> {
         // NOTE: Unlike BorrowRefMut::clone, new is called to create the initial
         // mutable reference, and so there must currently be no existing
         // references. Thus, while clone increments the mutable refcount, here
-        // we simply go directly from UNUSED to MIN_WRITING.
+        // we explicitly only allow going from UNUSED to UNUSED - 1.
         match borrow.get() {
             UNUSED => {
-                borrow.set(MIN_WRITING);
+                borrow.set(UNUSED - 1);
                 Some(BorrowRefMut { borrow: borrow })
             },
             _ => None,
@@ -1284,10 +1279,10 @@ impl<'b> BorrowRefMut<'b> {
     #[inline]
     fn clone(&self) -> BorrowRefMut<'b> {
         let borrow = self.borrow.get();
-        debug_assert!(borrow >= MIN_WRITING);
-        // Prevent the borrow counter from overflowing.
-        assert!(borrow != !0);
-        self.borrow.set(borrow + 1);
+        debug_assert!(borrow < UNUSED);
+        // Prevent the borrow counter from underflowing.
+        assert!(borrow != isize::min_value());
+        self.borrow.set(borrow - 1);
         BorrowRefMut { borrow: self.borrow }
     }
 }
